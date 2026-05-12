@@ -4,6 +4,15 @@ import session from 'express-session';
 import cookieParser from 'cookie-parser';
 import Database from 'better-sqlite3';
 import { google } from 'googleapis';
+import bcrypt from 'bcryptjs';
+import * as admin from 'firebase-admin';
+
+// Initialize Firebase Admin
+if (admin.apps.length === 0) {
+  admin.initializeApp();
+}
+
+const firestore = admin.firestore();
 
 declare module 'express-session' {
   interface SessionData {
@@ -14,6 +23,7 @@ declare module 'express-session' {
 const app = express();
 const PORT = 3000;
 
+app.set('trust proxy', 1); // Respect X-Forwarded-Proto header
 app.use(express.json());
 app.use(cookieParser());
 app.use(
@@ -21,10 +31,12 @@ app.use(
     secret: process.env.SESSION_SECRET || 'nexus-hub-secret-key',
     resave: false,
     saveUninitialized: false,
+    proxy: true, // Required for secure cookies behind a proxy
     cookie: {
-      secure: process.env.NODE_ENV === 'production',
+      secure: true, // Always true in AI Studio as it's served over HTTPS
       sameSite: 'none',
       httpOnly: true,
+      maxAge: 24 * 60 * 60 * 1000, // 24 hours
     },
   })
 );
@@ -37,11 +49,21 @@ db.exec(`
   CREATE TABLE IF NOT EXISTS users (
     id TEXT PRIMARY KEY,
     email TEXT UNIQUE,
+    password_hash TEXT,
     name TEXT,
     avatar_url TEXT,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
   );
+`);
 
+// Migration: ensure password_hash exists if the table was already created
+try {
+  db.exec('ALTER TABLE users ADD COLUMN password_hash TEXT');
+} catch (e) {
+  // Column already exists
+}
+
+db.exec(`
   CREATE TABLE IF NOT EXISTS profiles (
     user_id TEXT PRIMARY KEY,
     bio TEXT,
@@ -116,6 +138,48 @@ app.get('/api/health', (req, res) => {
 });
 
 // Auth Routes
+app.post('/api/auth/firebase', async (req, res) => {
+  try {
+    const { idToken, name: displayName } = req.body;
+    if (!idToken) {
+      return res.status(400).json({ error: 'ID Token is required' });
+    }
+
+    const decodedToken = await admin.auth().verifyIdToken(idToken);
+    const uid = decodedToken.uid;
+    const email = decodedToken.email;
+    const picture = decodedToken.picture;
+    const name = displayName || decodedToken.name || email?.split('@')[0] || 'User';
+
+    // Sync with Firestore
+    const userRef = firestore.collection('users').doc(uid);
+    const userDoc = await userRef.get();
+
+    if (!userDoc.exists) {
+      await userRef.set({
+        email,
+        name,
+        avatarUrl: picture || '',
+        createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+      await userRef.collection('profile').doc('public').set({
+        language: 'en'
+      });
+    } else {
+      await userRef.update({
+        name: name,
+        avatarUrl: picture || userDoc.data()?.avatarUrl || '',
+      });
+    }
+
+    req.session.userId = uid;
+    res.json({ success: true });
+  } catch (error) {
+    console.error('Firebase Auth error:', error);
+    res.status(401).json({ error: 'Invalid token' });
+  }
+});
+
 app.get('/api/auth/url', (req, res) => {
   const provider = req.query.provider as string;
   let url = '';
@@ -217,20 +281,31 @@ app.get('/auth/callback', async (req, res) => {
 });
 
 // Get current user
-app.get('/api/user', (req, res) => {
+app.get('/api/user', async (req, res) => {
+  console.log(`GET /api/user - Session ID: ${req.sessionID}, User ID: ${req.session.userId}`);
   if (!req.session.userId) {
     res.status(401).json({ error: 'Not authenticated' });
     return;
   }
 
-  const user = db.prepare('SELECT id, name, email, avatar_url FROM users WHERE id = ?').get(req.session.userId);
-  
-  if (!user) {
-    res.status(404).json({ error: 'User not found' });
-    return;
-  }
+  try {
+    const userDoc = await firestore.collection('users').doc(req.session.userId).get();
+    if (!userDoc.exists) {
+      res.status(404).json({ error: 'User not found' });
+      return;
+    }
 
-  res.json(user);
+    const userData = userDoc.data();
+    res.json({
+      id: userDoc.id,
+      name: userData?.name,
+      email: userData?.email,
+      avatar_url: userData?.avatarUrl,
+    });
+  } catch (error) {
+    console.error('Get user firestore error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
 });
 
 app.post('/api/auth/logout', (req, res) => {

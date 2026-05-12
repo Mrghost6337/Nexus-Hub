@@ -27,17 +27,23 @@ export function Dashboard() {
   useEffect(() => {
     // Fetch user data
     fetch('/api/user')
-      .then(res => {
+      .then(async res => {
         if (!res.ok) {
           if (res.status === 401) {
             navigate('/login');
+            return null;
           }
-          throw new Error('Failed to fetch user');
+          const errorData = await res.json().catch(() => ({}));
+          throw new Error(errorData.error || `Failed to fetch user (${res.status})`);
         }
         return res.json();
       })
-      .then(data => setUser(data))
-      .catch(console.error);
+      .then(data => {
+        if (data) setUser(data);
+      })
+      .catch(err => {
+        console.error('Dashboard user fetch error:', err);
+      });
   }, [navigate]);
 
   const handleLogout = async () => {
